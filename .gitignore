@@ -1,0 +1,33 @@
+# Зависимости
+node_modules/
+package-lock.json
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Прод
+dist/
+build/
+.next/
+out/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.sublime-workspace
+*.sublime-project
+
+# Логи
+logs/
+*.log
+
+# Misc
+.cache/
+tmp/
+temp/
+.parcel-cache/
