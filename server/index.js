@@ -1,386 +1,826 @@
 const express = require('express');
 const cors = require('cors');
-const swaggerJsdoc = require('swagger-jsdoc');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
 const swaggerUi = require('swagger-ui-express');
 const products = require('./products');
 
 const app = express();
+const PORT = process.env.PORT || 4000;
 
-// Middleware
+const ACCESS_SECRET = process.env.ACCESS_SECRET || 'access_secret';
+const REFRESH_SECRET = process.env.REFRESH_SECRET || 'refresh_secret';
+const ACCESS_EXPIRES_IN = '15m';
+const REFRESH_EXPIRES_IN = '7d';
+
+const ROLES = {
+  USER: 'user',
+  SELLER: 'seller',
+  ADMIN: 'admin'
+};
+
+let users = [];
+let nextUserId = 1;
+const refreshTokens = new Set();
+
 app.use(cors());
 app.use(express.json());
-app.use(express.static('public'));
 
-// Swagger configuration
-const swaggerOptions = {
-  definition: {
-    openapi: '3.0.3',
-    info: {
-      title: 'Products API',
-      version: '1.0.0',
-      description: 'API для управления каталогом товаров',
-      contact: {
-        name: 'API Support',
-        email: 'support@example.com'
+const openApiSpec = {
+  openapi: '3.0.3',
+  info: {
+    title: 'Shop API',
+    version: '1.0.0',
+    description: 'API для практических работ 9-11: JWT, refresh и RBAC'
+  },
+  servers: [
+    {
+      url: `http://localhost:${PORT}`,
+      description: 'Local server'
+    }
+  ],
+  components: {
+    securitySchemes: {
+      bearerAuth: {
+        type: 'http',
+        scheme: 'bearer',
+        bearerFormat: 'JWT'
+      },
+      refreshTokenHeader: {
+        type: 'apiKey',
+        in: 'header',
+        name: 'x-refresh-token'
       }
     },
-    servers: [
-      {
-        url: 'http://localhost:4000',
-        description: 'Development server'
-      }
-    ],
-    components: {
-      schemas: {
-        Product: {
-          type: 'object',
-          required: ['id', 'name', 'category', 'description', 'price', 'stock', 'rating', 'image'],
-          properties: {
-            id: { type: 'integer', example: 1 },
-            name: { type: 'string', example: 'GIGABYTE GeForce RTX 4070 Ti GAMING OC 12GB' },
-            category: {
-              type: 'string',
-              enum: ['Видеокарты', 'Телевизоры', 'Смартфоны'],
-              example: 'Видеокарты'
-            },
-            description: {
-              type: 'string',
-              example: 'Мощная игровая видеокарта NVIDIA RTX 4070 Ti с 12 ГБ видеопамяти GDDR6X.'
-            },
-            price: { type: 'number', example: 77990 },
-            stock: { type: 'integer', example: 4 },
-            rating: { type: 'number', minimum: 0, maximum: 5, example: 4.8 },
-            image: {
-              type: 'string',
-              format: 'uri',
-              example: 'https://c.dns-shop.ru/thumb/st4/fit/500/500/0ed9080ac788c2c189bfa796769243ad/e290232779fd9cb377f51b95409c7a5cf6d89ceb4c40a2ddb728dfc3549c8088.jpg.webp'
-            }
-          }
-        },
-        ProductInput: {
-          type: 'object',
-          required: ['name', 'category', 'description', 'price', 'stock', 'rating', 'image'],
-          properties: {
-            name: { type: 'string', example: 'MSI GeForce RTX 4080 VENTUS 3X 16GB' },
-            category: {
-              type: 'string',
-              enum: ['Видеокарты', 'Телевизоры', 'Смартфоны'],
-              example: 'Видеокарты'
-            },
-            description: {
-              type: 'string',
-              example: 'Современная видеокарта RTX 4080 с отличным охлаждением'
-            },
-            price: { type: 'number', example: 124990 },
-            stock: { type: 'integer', example: 7 },
-            rating: { type: 'number', minimum: 0, maximum: 5, example: 4.7 },
-            image: {
-              type: 'string',
-              format: 'uri',
-              example: 'https://example.com/images/msi-rtx4080.jpg'
-            }
-          }
-        },
-        Error: {
-          type: 'object',
-          properties: {
-            error: { type: 'string', example: 'Product not found' }
-          }
+    schemas: {
+      Error: {
+        type: 'object',
+        properties: {
+          error: { type: 'string', example: 'Invalid credentials' }
         }
+      },
+      RegisterInput: {
+        type: 'object',
+        required: ['email', 'first_name', 'last_name', 'password'],
+        properties: {
+          email: { type: 'string', format: 'email', example: 'user@example.com' },
+          first_name: { type: 'string', example: 'Ivan' },
+          last_name: { type: 'string', example: 'Ivanov' },
+          password: { type: 'string', example: 'qwerty123' },
+          role: { type: 'string', enum: ['user', 'seller', 'admin'], example: 'user' }
+        }
+      },
+      LoginInput: {
+        type: 'object',
+        required: ['email', 'password'],
+        properties: {
+          email: { type: 'string', format: 'email', example: 'admin@example.com' },
+          password: { type: 'string', example: 'admin123' }
+        }
+      },
+      AuthTokens: {
+        type: 'object',
+        properties: {
+          accessToken: { type: 'string' },
+          refreshToken: { type: 'string' }
+        }
+      },
+      User: {
+        type: 'object',
+        properties: {
+          id: { type: 'integer', example: 1 },
+          email: { type: 'string', format: 'email', example: 'user@example.com' },
+          first_name: { type: 'string', example: 'Ivan' },
+          last_name: { type: 'string', example: 'Ivanov' },
+          role: { type: 'string', enum: ['user', 'seller', 'admin'], example: 'user' },
+          is_blocked: { type: 'boolean', example: false }
+        }
+      },
+      UserUpdateInput: {
+        type: 'object',
+        properties: {
+          first_name: { type: 'string', example: 'Petr' },
+          last_name: { type: 'string', example: 'Petrov' },
+          role: { type: 'string', enum: ['user', 'seller', 'admin'], example: 'seller' }
+        }
+      },
+      ProductInput: {
+        type: 'object',
+        required: ['title', 'category', 'description', 'price'],
+        properties: {
+          title: { type: 'string', example: 'RTX 4070' },
+          category: { type: 'string', example: 'Видеокарты' },
+          description: { type: 'string', example: 'Игровая видеокарта' },
+          price: { type: 'number', example: 55000 },
+          stock: { type: 'integer', example: 5 },
+          rating: { type: 'number', example: 4.7 },
+          image: { type: 'string', format: 'uri', example: 'https://example.com/image.jpg' }
+        }
+      },
+      Product: {
+        allOf: [
+          { $ref: '#/components/schemas/ProductInput' },
+          {
+            type: 'object',
+            properties: {
+              id: { type: 'integer', example: 1 },
+              name: { type: 'string', example: 'RTX 4070' }
+            }
+          }
+        ]
       }
     }
   },
-  apis: ['./index.js']
+  paths: {
+    '/api/auth/register': {
+      post: {
+        summary: 'Регистрация пользователя',
+        tags: ['Auth'],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: { $ref: '#/components/schemas/RegisterInput' }
+            }
+          }
+        },
+        responses: {
+          201: {
+            description: 'Пользователь создан',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/User' }
+              }
+            }
+          },
+          400: { description: 'Некорректные данные' },
+          409: { description: 'Пользователь уже существует' }
+        }
+      }
+    },
+    '/api/auth/login': {
+      post: {
+        summary: 'Вход в систему',
+        tags: ['Auth'],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: { $ref: '#/components/schemas/LoginInput' }
+            }
+          }
+        },
+        responses: {
+          200: {
+            description: 'Пара токенов',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/AuthTokens' }
+              }
+            }
+          },
+          400: { description: 'Некорректные данные' },
+          401: { description: 'Неверные учетные данные' },
+          403: { description: 'Пользователь заблокирован' }
+        }
+      }
+    },
+    '/api/auth/refresh': {
+      post: {
+        summary: 'Обновление access/refresh токенов',
+        tags: ['Auth'],
+        security: [{ refreshTokenHeader: [] }],
+        responses: {
+          200: {
+            description: 'Новая пара токенов',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/AuthTokens' }
+              }
+            }
+          },
+          400: { description: 'refresh token не передан' },
+          401: { description: 'refresh token невалиден' }
+        }
+      }
+    },
+    '/api/auth/me': {
+      get: {
+        summary: 'Текущий пользователь',
+        tags: ['Auth'],
+        security: [{ bearerAuth: [] }],
+        responses: {
+          200: {
+            description: 'Профиль текущего пользователя',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/User' }
+              }
+            }
+          },
+          401: { description: 'Не авторизован' },
+          404: { description: 'Пользователь не найден' }
+        }
+      }
+    },
+    '/api/users': {
+      get: {
+        summary: 'Получить список пользователей',
+        tags: ['Users'],
+        security: [{ bearerAuth: [] }],
+        responses: {
+          200: {
+            description: 'Список пользователей',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'array',
+                  items: { $ref: '#/components/schemas/User' }
+                }
+              }
+            }
+          },
+          401: { description: 'Не авторизован' },
+          403: { description: 'Недостаточно прав' }
+        }
+      }
+    },
+    '/api/users/{id}': {
+      get: {
+        summary: 'Получить пользователя по id',
+        tags: ['Users'],
+        security: [{ bearerAuth: [] }],
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'integer' } }
+        ],
+        responses: {
+          200: {
+            description: 'Пользователь',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/User' }
+              }
+            }
+          },
+          404: { description: 'Пользователь не найден' }
+        }
+      },
+      put: {
+        summary: 'Обновить пользователя',
+        tags: ['Users'],
+        security: [{ bearerAuth: [] }],
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'integer' } }
+        ],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: { $ref: '#/components/schemas/UserUpdateInput' }
+            }
+          }
+        },
+        responses: {
+          200: {
+            description: 'Пользователь обновлен',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/User' }
+              }
+            }
+          },
+          400: { description: 'Некорректная роль' },
+          404: { description: 'Пользователь не найден' }
+        }
+      },
+      delete: {
+        summary: 'Заблокировать пользователя',
+        tags: ['Users'],
+        security: [{ bearerAuth: [] }],
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'integer' } }
+        ],
+        responses: {
+          204: { description: 'Пользователь заблокирован' },
+          404: { description: 'Пользователь не найден' }
+        }
+      }
+    },
+    '/api/products': {
+      post: {
+        summary: 'Создать товар',
+        tags: ['Products'],
+        security: [{ bearerAuth: [] }],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: { $ref: '#/components/schemas/ProductInput' }
+            }
+          }
+        },
+        responses: {
+          201: {
+            description: 'Товар создан',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/Product' }
+              }
+            }
+          },
+          400: { description: 'Ошибка валидации' },
+          403: { description: 'Недостаточно прав' }
+        }
+      },
+      get: {
+        summary: 'Получить список товаров',
+        tags: ['Products'],
+        security: [{ bearerAuth: [] }],
+        parameters: [
+          { name: 'category', in: 'query', required: false, schema: { type: 'string' } }
+        ],
+        responses: {
+          200: {
+            description: 'Список товаров',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'array',
+                  items: { $ref: '#/components/schemas/Product' }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    '/api/products/{id}': {
+      get: {
+        summary: 'Получить товар по id',
+        tags: ['Products'],
+        security: [{ bearerAuth: [] }],
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'integer' } }
+        ],
+        responses: {
+          200: {
+            description: 'Товар',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/Product' }
+              }
+            }
+          },
+          404: { description: 'Товар не найден' }
+        }
+      },
+      put: {
+        summary: 'Обновить товар',
+        tags: ['Products'],
+        security: [{ bearerAuth: [] }],
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'integer' } }
+        ],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: { $ref: '#/components/schemas/ProductInput' }
+            }
+          }
+        },
+        responses: {
+          200: {
+            description: 'Товар обновлен',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/Product' }
+              }
+            }
+          },
+          400: { description: 'Ошибка валидации' },
+          403: { description: 'Недостаточно прав' },
+          404: { description: 'Товар не найден' }
+        }
+      },
+      delete: {
+        summary: 'Удалить товар',
+        tags: ['Products'],
+        security: [{ bearerAuth: [] }],
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'integer' } }
+        ],
+        responses: {
+          204: { description: 'Товар удален' },
+          403: { description: 'Недостаточно прав' },
+          404: { description: 'Товар не найден' }
+        }
+      }
+    }
+  }
 };
 
-const swaggerSpec = swaggerJsdoc(swaggerOptions);
+app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(openApiSpec));
+app.get('/swagger.json', (req, res) => res.json(openApiSpec));
 
-// Swagger UI
-app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
-  explorer: true
-}));
+function toPublicUser(user) {
+  return {
+    id: user.id,
+    email: user.email,
+    first_name: user.first_name,
+    last_name: user.last_name,
+    role: user.role,
+    is_blocked: user.is_blocked
+  };
+}
 
-// Redirect root → /api/products
-app.get('/', (req, res) => {
-  res.redirect('/api/products');
-});
+function toPublicProduct(product) {
+  return {
+    ...product,
+    name: product.title
+  };
+}
 
-/**
- * @swagger
- * /api/products:
- *   get:
- *     summary: Получить список всех товаров
- *     description: Возвращает массив всех товаров. Можно фильтровать по категории.
- *     tags: [Products]
- *     parameters:
- *       - in: query
- *         name: category
- *         required: false
- *         schema:
- *           type: string
- *           enum: [Видеокарты, Телевизоры, Смартфоны]
- *     responses:
- *       200:
- *         description: Успешный запрос
- *         content:
- *           application/json:
- *             schema:
- *               type: array
- *               items:
- *                 $ref: '#/components/schemas/Product'
- */
-app.get('/api/products', (req, res) => {
-  const { category } = req.query;
-  if (category) {
-    const filtered = products.filter(p => p.category === category);
-    return res.json(filtered);
+function generateAccessToken(user) {
+  return jwt.sign(
+    {
+      sub: String(user.id),
+      email: user.email,
+      role: user.role
+    },
+    ACCESS_SECRET,
+    { expiresIn: ACCESS_EXPIRES_IN }
+  );
+}
+
+function generateRefreshToken(user) {
+  return jwt.sign(
+    {
+      sub: String(user.id),
+      email: user.email,
+      role: user.role
+    },
+    REFRESH_SECRET,
+    { expiresIn: REFRESH_EXPIRES_IN }
+  );
+}
+
+function authMiddleware(req, res, next) {
+  const header = req.headers.authorization || '';
+  const [scheme, token] = header.split(' ');
+
+  if (scheme !== 'Bearer' || !token) {
+    return res.status(401).json({ error: 'Missing or invalid Authorization header' });
   }
-  res.json(products);
-});
 
-/**
- * @swagger
- * /api/products/{id}:
- *   get:
- *     summary: Получить товар по ID
- *     tags: [Products]
- *     parameters:
- *       - in: path
- *         name: id
- *         required: true
- *         schema:
- *           type: integer
- *           minimum: 1
- *         example: 1
- *     responses:
- *       200:
- *         description: Товар найден
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Product'
- *       404:
- *         description: Товар не найден
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- */
-app.get('/api/products/:id', (req, res) => {
-  const id = Number(req.params.id);
-  const product = products.find(p => p.id === id);
-  if (!product) return res.status(404).json({ error: 'Product not found' });
-  res.json(product);
-});
-
-/**
- * @swagger
- * /api/products:
- *   post:
- *     summary: Добавить новый товар
- *     description: Создаёт новый товар в каталоге
- *     tags: [Products]
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             $ref: '#/components/schemas/ProductInput'
- *           example:   # ← Вот этот блок делает пример видимым и копируемым в Swagger UI
- *             name: "Samsung Galaxy S25 Ultra"
- *             category: "Смартфоны"
- *             description: "Флагман 2026 года с 200 МП камерой и Snapdragon 8 Elite"
- *             price: 149990
- *             stock: 12
- *             rating: 4.9
- *             image: "https://example.com/images/s25-ultra.jpg"
- *     responses:
- *       201:
- *         description: Товар успешно создан
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Product'
- *       400:
- *         description: Ошибка валидации (неверные данные)
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       500:
- *         description: Внутренняя ошибка сервера
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- */
-app.post('/api/products', (req, res) => {
   try {
-    const { name, category, description, price, stock, rating, image } = req.body;
+    const payload = jwt.verify(token, ACCESS_SECRET);
+    req.user = payload;
+    next();
+  } catch (error) {
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+}
 
-    const requiredFields = ['name', 'category', 'description', 'price', 'stock', 'rating', 'image'];
-    const missing = requiredFields.filter(f => req.body[f] == null);
-    if (missing.length > 0) {
-      return res.status(400).json({ error: `Missing required fields: ${missing.join(', ')}` });
+function roleMiddleware(allowedRoles) {
+  return (req, res, next) => {
+    if (!req.user || !allowedRoles.includes(req.user.role)) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    next();
+  };
+}
+
+function getRefreshTokenFromHeaders(req) {
+  const headerToken = req.headers['x-refresh-token'];
+  if (headerToken) {
+    return String(headerToken).trim();
+  }
+
+  const auth = req.headers.authorization || '';
+  const [scheme, token] = auth.split(' ');
+  if (scheme === 'Bearer' && token) {
+    return token;
+  }
+
+  return '';
+}
+
+function validateProductPayload(payload) {
+  const title = String(payload.title ?? payload.name ?? '').trim();
+  const category = String(payload.category ?? '').trim();
+  const description = String(payload.description ?? '').trim();
+  const price = Number(payload.price);
+
+  if (!title || !category || !description || Number.isNaN(price)) {
+    return { error: 'title, category, description and price are required' };
+  }
+
+  if (price < 0) {
+    return { error: 'price must be non-negative number' };
+  }
+
+  const data = { title, category, description, price };
+
+  if (payload.stock !== undefined) {
+    const stock = Number(payload.stock);
+    if (!Number.isInteger(stock) || stock < 0) {
+      return { error: 'stock must be non-negative integer' };
+    }
+    data.stock = stock;
+  }
+
+  if (payload.rating !== undefined) {
+    const rating = Number(payload.rating);
+    if (Number.isNaN(rating) || rating < 0 || rating > 5) {
+      return { error: 'rating must be in range 0..5' };
+    }
+    data.rating = rating;
+  }
+
+  if (payload.image !== undefined) {
+    data.image = String(payload.image).trim();
+  }
+
+  return { data };
+}
+
+function seedUsers() {
+  const admin = {
+    id: nextUserId++,
+    email: 'admin@example.com',
+    first_name: 'Admin',
+    last_name: 'Root',
+    passwordHash: bcrypt.hashSync('admin123', 10),
+    role: ROLES.ADMIN,
+    is_blocked: false
+  };
+
+  const seller = {
+    id: nextUserId++,
+    email: 'seller@example.com',
+    first_name: 'Seller',
+    last_name: 'Team',
+    passwordHash: bcrypt.hashSync('seller123', 10),
+    role: ROLES.SELLER,
+    is_blocked: false
+  };
+
+  users.push(admin, seller);
+}
+
+seedUsers();
+
+app.get('/', (req, res) => {
+  res.json({
+    message: 'Practice API 9-11',
+    docs: {
+      swaggerUi: `http://localhost:${PORT}/api-docs`,
+      openApiJson: `http://localhost:${PORT}/swagger.json`
+    },
+    credentials: {
+      admin: { email: 'admin@example.com', password: 'admin123' },
+      seller: { email: 'seller@example.com', password: 'seller123' }
+    }
+  });
+});
+
+app.post('/api/auth/register', async (req, res) => {
+  const email = String(req.body.email ?? '').trim().toLowerCase();
+  const firstName = String(req.body.first_name ?? '').trim();
+  const lastName = String(req.body.last_name ?? '').trim();
+  const password = String(req.body.password ?? '');
+  const role = String(req.body.role ?? ROLES.USER).trim().toLowerCase();
+
+  if (!email || !firstName || !lastName || !password) {
+    return res.status(400).json({ error: 'email, first_name, last_name and password are required' });
+  }
+
+  if (![ROLES.USER, ROLES.SELLER, ROLES.ADMIN].includes(role)) {
+    return res.status(400).json({ error: 'Invalid role' });
+  }
+
+  const exists = users.some(u => u.email === email);
+  if (exists) {
+    return res.status(409).json({ error: 'user with this email already exists' });
+  }
+
+  const user = {
+    id: nextUserId++,
+    email,
+    first_name: firstName,
+    last_name: lastName,
+    passwordHash: await bcrypt.hash(password, 10),
+    role,
+    is_blocked: false
+  };
+
+  users.push(user);
+  return res.status(201).json(toPublicUser(user));
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  const email = String(req.body.email ?? '').trim().toLowerCase();
+  const password = String(req.body.password ?? '');
+
+  if (!email || !password) {
+    return res.status(400).json({ error: 'email and password are required' });
+  }
+
+  const user = users.find(u => u.email === email);
+  if (!user) {
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+
+  if (user.is_blocked) {
+    return res.status(403).json({ error: 'User is blocked' });
+  }
+
+  const isValid = await bcrypt.compare(password, user.passwordHash);
+  if (!isValid) {
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+
+  const accessToken = generateAccessToken(user);
+  const refreshToken = generateRefreshToken(user);
+  refreshTokens.add(refreshToken);
+
+  return res.json({ accessToken, refreshToken });
+});
+
+app.post('/api/auth/refresh', (req, res) => {
+  const refreshToken = getRefreshTokenFromHeaders(req);
+
+  if (!refreshToken) {
+    return res.status(400).json({ error: 'refreshToken is required in headers' });
+  }
+
+  if (!refreshTokens.has(refreshToken)) {
+    return res.status(401).json({ error: 'Invalid refresh token' });
+  }
+
+  try {
+    const payload = jwt.verify(refreshToken, REFRESH_SECRET);
+    const userId = Number(payload.sub);
+    const user = users.find(u => u.id === userId);
+
+    if (!user || user.is_blocked) {
+      refreshTokens.delete(refreshToken);
+      return res.status(401).json({ error: 'User not found or blocked' });
     }
 
-    const allowedCategories = ['Видеокарты', 'Телевизоры', 'Смартфоны'];
-    if (!allowedCategories.includes(category)) {
-      return res.status(400).json({ error: `Invalid category. Allowed: ${allowedCategories.join(', ')}` });
-    }
+    refreshTokens.delete(refreshToken);
 
-    const ratingNum = Number(rating);
-    if (isNaN(ratingNum) || ratingNum < 0 || ratingNum > 5) {
-      return res.status(400).json({ error: 'Rating must be between 0 and 5' });
-    }
+    const newAccessToken = generateAccessToken(user);
+    const newRefreshToken = generateRefreshToken(user);
+    refreshTokens.add(newRefreshToken);
 
-    const priceNum = Number(price);
-    if (isNaN(priceNum) || priceNum <= 0) {
-      return res.status(400).json({ error: 'Price must be positive number' });
-    }
-
-    const stockNum = Number(stock);
-    if (isNaN(stockNum) || stockNum < 0 || !Number.isInteger(stockNum)) {
-      return res.status(400).json({ error: 'Stock must be non-negative integer' });
-    }
-
-    const newId = products.length === 0 ? 1 : Math.max(...products.map(p => p.id)) + 1;
-
-    const newProduct = {
-      id: newId,
-      name: String(name).trim(),
-      category,
-      description: String(description).trim(),
-      price: priceNum,
-      stock: stockNum,
-      rating: ratingNum,
-      image: String(image).trim(),
-    };
-
-    products.push(newProduct);
-    res.status(201).json(newProduct);
-
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Internal server error' });
+    return res.json({ accessToken: newAccessToken, refreshToken: newRefreshToken });
+  } catch (error) {
+    refreshTokens.delete(refreshToken);
+    return res.status(401).json({ error: 'Invalid or expired refresh token' });
   }
 });
 
-/**
- * @swagger
- * /api/products/{id}:
- *   patch:
- *     summary: Частично обновить товар
- *     tags: [Products]
- *     parameters:
- *       - in: path
- *         name: id
- *         required: true
- *         schema:
- *           type: integer
- *           minimum: 1
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             properties:
- *               name: { type: 'string' }
- *               category:
- *                 type: 'string'
- *                 enum: [Видеокарты, Телевизоры, Смартфоны]
- *               description: { type: 'string' }
- *               price: { type: 'number' }
- *               stock: { type: 'integer' }
- *               rating: { type: 'number', minimum: 0, maximum: 5 }
- *               image: { type: 'string', format: 'uri' }
- *     responses:
- *       200:
- *         description: Товар обновлён
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Product'
- *       400:
- *         description: Неверные данные
- *       404:
- *         description: Товар не найден
- */
-app.patch('/api/products/:id', (req, res) => {
+app.get('/api/auth/me', authMiddleware, roleMiddleware([ROLES.USER, ROLES.SELLER, ROLES.ADMIN]), (req, res) => {
+  const userId = Number(req.user.sub);
+  const user = users.find(u => u.id === userId);
+
+  if (!user || user.is_blocked) {
+    return res.status(404).json({ error: 'User not found' });
+  }
+
+  return res.json(toPublicUser(user));
+});
+
+app.get('/api/users', authMiddleware, roleMiddleware([ROLES.ADMIN]), (req, res) => {
+  return res.json(users.map(toPublicUser));
+});
+
+app.get('/api/users/:id', authMiddleware, roleMiddleware([ROLES.ADMIN]), (req, res) => {
+  const id = Number(req.params.id);
+  const user = users.find(u => u.id === id);
+
+  if (!user) {
+    return res.status(404).json({ error: 'User not found' });
+  }
+
+  return res.json(toPublicUser(user));
+});
+
+app.put('/api/users/:id', authMiddleware, roleMiddleware([ROLES.ADMIN]), (req, res) => {
+  const id = Number(req.params.id);
+  const user = users.find(u => u.id === id);
+
+  if (!user) {
+    return res.status(404).json({ error: 'User not found' });
+  }
+
+  const firstName = req.body.first_name !== undefined ? String(req.body.first_name).trim() : user.first_name;
+  const lastName = req.body.last_name !== undefined ? String(req.body.last_name).trim() : user.last_name;
+  const role = req.body.role !== undefined ? String(req.body.role).trim().toLowerCase() : user.role;
+
+  if (![ROLES.USER, ROLES.SELLER, ROLES.ADMIN].includes(role)) {
+    return res.status(400).json({ error: 'Invalid role' });
+  }
+
+  user.first_name = firstName;
+  user.last_name = lastName;
+  user.role = role;
+
+  return res.json(toPublicUser(user));
+});
+
+app.delete('/api/users/:id', authMiddleware, roleMiddleware([ROLES.ADMIN]), (req, res) => {
+  const id = Number(req.params.id);
+  const user = users.find(u => u.id === id);
+
+  if (!user) {
+    return res.status(404).json({ error: 'User not found' });
+  }
+
+  user.is_blocked = true;
+
+  for (const token of refreshTokens) {
+    try {
+      const payload = jwt.verify(token, REFRESH_SECRET);
+      if (Number(payload.sub) === user.id) {
+        refreshTokens.delete(token);
+      }
+    } catch (error) {
+      refreshTokens.delete(token);
+    }
+  }
+
+  return res.status(204).send();
+});
+
+app.post('/api/products', authMiddleware, roleMiddleware([ROLES.SELLER, ROLES.ADMIN]), (req, res) => {
+  const validation = validateProductPayload(req.body);
+  if (validation.error) {
+    return res.status(400).json({ error: validation.error });
+  }
+
+  const newId = products.length === 0 ? 1 : Math.max(...products.map(p => p.id)) + 1;
+  const product = { id: newId, ...validation.data };
+  products.push(product);
+
+  return res.status(201).json(toPublicProduct(product));
+});
+
+app.get('/api/products', authMiddleware, roleMiddleware([ROLES.USER, ROLES.SELLER, ROLES.ADMIN]), (req, res) => {
+  const category = String(req.query.category ?? '').trim();
+
+  if (!category) {
+    return res.json(products.map(toPublicProduct));
+  }
+
+  const filtered = products.filter(p => p.category === category);
+  return res.json(filtered.map(toPublicProduct));
+});
+
+app.get('/api/products/:id', authMiddleware, roleMiddleware([ROLES.USER, ROLES.SELLER, ROLES.ADMIN]), (req, res) => {
   const id = Number(req.params.id);
   const product = products.find(p => p.id === id);
-  if (!product) return res.status(404).json({ error: 'Product not found' });
 
-  if (req.body.category) {
-    const allowed = ['Видеокарты', 'Телевизоры', 'Смартфоны'];
-    if (!allowed.includes(req.body.category)) {
-      return res.status(400).json({ error: `Invalid category. Allowed: ${allowed.join(', ')}` });
-    }
+  if (!product) {
+    return res.status(404).json({ error: 'Product not found' });
   }
 
-  if (req.body.rating !== undefined) {
-    const r = Number(req.body.rating);
-    if (isNaN(r) || r < 0 || r > 5) {
-      return res.status(400).json({ error: 'Rating must be 0–5' });
-    }
-  }
-
-  ['name', 'category', 'description', 'image'].forEach(key => {
-    if (req.body[key] !== undefined) product[key] = String(req.body[key]).trim();
-  });
-
-  if (req.body.price !== undefined) {
-    const p = Number(req.body.price);
-    if (!isNaN(p) && p > 0) product.price = p;
-  }
-
-  if (req.body.stock !== undefined) {
-    const s = Number(req.body.stock);
-    if (!isNaN(s) && s >= 0 && Number.isInteger(s)) product.stock = s;
-  }
-
-  if (req.body.rating !== undefined) {
-    product.rating = Number(req.body.rating);
-  }
-
-  res.json(product);
+  return res.json(toPublicProduct(product));
 });
 
-/**
- * @swagger
- * /api/products/{id}:
- *   delete:
- *     summary: Удалить товар
- *     tags: [Products]
- *     parameters:
- *       - in: path
- *         name: id
- *         required: true
- *         schema:
- *           type: integer
- *           minimum: 1
- *     responses:
- *       204:
- *         description: Товар удалён
- *       404:
- *         description: Товар не найден
- */
-app.delete('/api/products/:id', (req, res) => {
+app.put('/api/products/:id', authMiddleware, roleMiddleware([ROLES.SELLER, ROLES.ADMIN]), (req, res) => {
   const id = Number(req.params.id);
   const index = products.findIndex(p => p.id === id);
-  if (index === -1) return res.status(404).json({ error: 'Product not found' });
+
+  if (index === -1) {
+    return res.status(404).json({ error: 'Product not found' });
+  }
+
+  const validation = validateProductPayload(req.body);
+  if (validation.error) {
+    return res.status(400).json({ error: validation.error });
+  }
+
+  const updated = { id, ...validation.data };
+  products[index] = updated;
+
+  return res.json(toPublicProduct(updated));
+});
+
+app.delete('/api/products/:id', authMiddleware, roleMiddleware([ROLES.ADMIN]), (req, res) => {
+  const id = Number(req.params.id);
+  const index = products.findIndex(p => p.id === id);
+
+  if (index === -1) {
+    return res.status(404).json({ error: 'Product not found' });
+  }
+
   products.splice(index, 1);
-  res.status(204).send();
+  return res.status(204).send();
 });
 
-// Raw OpenAPI JSON (удобно для Postman / генерации клиентов)
-app.get('/swagger.json', (req, res) => {
-  res.json(swaggerSpec);
-});
-
-const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
-  console.log(`Server running → http://localhost:${PORT}`);
-  console.log(`Swagger UI    → http://localhost:${PORT}/api-docs`);
+  console.log(`Server running on http://localhost:${PORT}`);
 });

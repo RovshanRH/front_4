@@ -1,167 +1,389 @@
-import React, { useEffect, useState, useMemo } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
 import ProductCard from './ProductCard'
+import apiClient, { clearTokens, getAccessToken, saveTokens } from './apiClient'
 
-const API = 'http://localhost:4000/api/products'
+const ROLE = {
+  USER: 'user',
+  SELLER: 'seller',
+  ADMIN: 'admin'
+}
+
+const emptyProduct = {
+  title: '',
+  category: '',
+  description: '',
+  price: '',
+  stock: '',
+  rating: '',
+  image: ''
+}
+
+const emptyRegisterForm = {
+  email: '',
+  first_name: '',
+  last_name: '',
+  password: '',
+  role: ROLE.USER
+}
+
+const emptyLoginForm = {
+  email: '',
+  password: ''
+}
 
 export default function App() {
+  const [authMode, setAuthMode] = useState('login')
+  const [registerForm, setRegisterForm] = useState(emptyRegisterForm)
+  const [loginForm, setLoginForm] = useState(emptyLoginForm)
+  const [user, setUser] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+
   const [products, setProducts] = useState([])
-  const [selected, setSelected] = useState(null)
+  const [selectedProduct, setSelectedProduct] = useState(null)
+  const [newProduct, setNewProduct] = useState(emptyProduct)
   const [editProduct, setEditProduct] = useState(null)
-  const [addModal, setAddModal] = useState(false)
 
-  const [newProduct, setNewProduct] = useState({
-    name: '', category: '', description: '', price: '', stock: '', rating: '', image: ''
-  })
-  const [newCustomCategory, setNewCustomCategory] = useState('')
-  const [editCustomCategory, setEditCustomCategory] = useState('')
+  const [users, setUsers] = useState([])
 
-  useEffect(() => {
-    fetch(API)
-      .then(r => r.json())
-      .then(setProducts)
-      .catch(console.error)
-  }, [])
+  const isSeller = user?.role === ROLE.SELLER || user?.role === ROLE.ADMIN
+  const isAdmin = user?.role === ROLE.ADMIN
 
   const categories = useMemo(() => {
-    const s = new Set(products.map(p => p.category).filter(Boolean))
-    return Array.from(s).sort()
+    const values = products.map((p) => p.category).filter(Boolean)
+    return Array.from(new Set(values)).sort((a, b) => a.localeCompare(b))
   }, [products])
 
-  // Prevent body scroll when any modal is open
   useEffect(() => {
-    if (selected || editProduct || addModal) {
-      document.body.style.overflow = 'hidden'
+    bootstrapSession()
+  }, [])
+
+  async function bootstrapSession() {
+    setLoading(true)
+    setError('')
+    const token = getAccessToken()
+
+    if (!token) {
+      setLoading(false)
+      return
+    }
+
+    try {
+      await loadMeAndData()
+    } catch (e) {
+      clearTokens()
+      setUser(null)
+      setProducts([])
+      setUsers([])
+      setError(extractError(e, 'Сессия истекла. Выполните вход снова.'))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function loadMeAndData() {
+    const me = await apiClient.get('/auth/me')
+    setUser(me.data)
+
+    const productsRes = await apiClient.get('/products')
+    setProducts(productsRes.data)
+
+    if (me.data.role === ROLE.ADMIN) {
+      const usersRes = await apiClient.get('/users')
+      setUsers(usersRes.data)
     } else {
-      document.body.style.overflow = ''
+      setUsers([])
     }
-    return () => {
-      document.body.style.overflow = ''
-    }
-  }, [selected, editProduct, addModal])
+  }
 
-  function handleAdd(e) {
+  function extractError(err, fallback) {
+    return err?.response?.data?.error || fallback
+  }
+
+  async function handleRegister(e) {
     e.preventDefault()
-    const body = {
-      name: newProduct.name,
-      category: newProduct.category === '__custom' ? newCustomCategory : newProduct.category,
-      description: newProduct.description,
-      price: Number(newProduct.price),
-      stock: Number(newProduct.stock),
-      rating: Number(newProduct.rating),
-      image: newProduct.image,
+    setError('')
+
+    try {
+      await apiClient.post('/auth/register', registerForm)
+      setAuthMode('login')
+      setRegisterForm(emptyRegisterForm)
+      setError('Регистрация успешна. Теперь выполните вход.')
+    } catch (e2) {
+      setError(extractError(e2, 'Не удалось зарегистрироваться'))
     }
-    fetch(API, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
-      .then(r => r.json())
-      .then(p => {
-        setProducts(prev => [...prev, p])
-        setNewProduct({ name: '', category: '', description: '', price: '', stock: '', rating: '', image: '' })
-        setNewCustomCategory('')
-        setAddModal(false)
-      })
-      .catch(console.error)
   }
 
-  function handleDelete(id) {
-    if (!confirm('Удалить товар?')) return
-    fetch(`${API}/${id}`, { method: 'DELETE' })
-      .then(r => {
-        if (r.status === 204) {
-          setProducts(prev => prev.filter(p => p.id !== id))
-          if (selected && selected.id === id) setSelected(null)
-        } else return r.json().then(err => Promise.reject(err))
-      })
-      .catch(console.error)
-  }
-
-  function handleEditSubmit(e) {
+  async function handleLogin(e) {
     e.preventDefault()
-    const id = editProduct.id
-    const body = {
-      name: editProduct.name,
-      category: editProduct.category === '__custom' ? editCustomCategory : editProduct.category,
-      description: editProduct.description,
-      price: Number(editProduct.price),
-      stock: Number(editProduct.stock),
-      rating: Number(editProduct.rating),
-      image: editProduct.image,
+    setError('')
+
+    try {
+      const response = await apiClient.post('/auth/login', loginForm)
+      const { accessToken, refreshToken } = response.data
+      saveTokens(accessToken, refreshToken)
+      setLoginForm(emptyLoginForm)
+      await loadMeAndData()
+    } catch (e2) {
+      setError(extractError(e2, 'Не удалось выполнить вход'))
     }
-    fetch(`${API}/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
-      .then(r => {
-        if (!r.ok) return r.json().then(err => Promise.reject(err))
-        return r.json()
-      })
-      .then(updated => {
-        setProducts(prev => prev.map(p => p.id === updated.id ? updated : p))
-        setEditProduct(null)
-        setEditCustomCategory('')
-        if (selected && selected.id === updated.id) setSelected(updated)
-      })
-      .catch(console.error)
   }
 
-  useEffect(() => {
-    if (editProduct) setEditCustomCategory('')
-  }, [editProduct])
+  function handleLogout() {
+    clearTokens()
+    setUser(null)
+    setProducts([])
+    setUsers([])
+    setError('')
+  }
+
+  async function handleCreateProduct(e) {
+    e.preventDefault()
+    setError('')
+
+    try {
+      const payload = {
+        title: newProduct.title,
+        category: newProduct.category,
+        description: newProduct.description,
+        price: Number(newProduct.price),
+        stock: newProduct.stock === '' ? undefined : Number(newProduct.stock),
+        rating: newProduct.rating === '' ? undefined : Number(newProduct.rating),
+        image: newProduct.image || undefined
+      }
+
+      const response = await apiClient.post('/products', payload)
+      setProducts((prev) => [...prev, response.data])
+      setNewProduct(emptyProduct)
+    } catch (e2) {
+      setError(extractError(e2, 'Не удалось создать товар'))
+    }
+  }
+
+  async function handleLoadProductById(id) {
+    setError('')
+
+    try {
+      const response = await apiClient.get(`/products/${id}`)
+      setSelectedProduct(response.data)
+    } catch (e2) {
+      setError(extractError(e2, 'Не удалось загрузить товар'))
+    }
+  }
+
+  async function handleUpdateProduct(e) {
+    e.preventDefault()
+    if (!editProduct) return
+
+    setError('')
+
+    try {
+      const payload = {
+        title: editProduct.title || editProduct.name,
+        category: editProduct.category,
+        description: editProduct.description,
+        price: Number(editProduct.price),
+        stock: editProduct.stock === '' || editProduct.stock === undefined ? undefined : Number(editProduct.stock),
+        rating: editProduct.rating === '' || editProduct.rating === undefined ? undefined : Number(editProduct.rating),
+        image: editProduct.image || undefined
+      }
+
+      const response = await apiClient.put(`/products/${editProduct.id}`, payload)
+      const updated = response.data
+      setProducts((prev) => prev.map((item) => (item.id === updated.id ? updated : item)))
+      setEditProduct(null)
+      if (selectedProduct?.id === updated.id) {
+        setSelectedProduct(updated)
+      }
+    } catch (e2) {
+      setError(extractError(e2, 'Не удалось обновить товар'))
+    }
+  }
+
+  async function handleDeleteProduct(id) {
+    if (!window.confirm('Удалить товар?')) return
+    setError('')
+
+    try {
+      await apiClient.delete(`/products/${id}`)
+      setProducts((prev) => prev.filter((item) => item.id !== id))
+      if (selectedProduct?.id === id) {
+        setSelectedProduct(null)
+      }
+    } catch (e2) {
+      setError(extractError(e2, 'Не удалось удалить товар'))
+    }
+  }
+
+  async function loadUsers() {
+    if (!isAdmin) return
+
+    try {
+      const response = await apiClient.get('/users')
+      setUsers(response.data)
+    } catch (e2) {
+      setError(extractError(e2, 'Не удалось получить список пользователей'))
+    }
+  }
+
+  async function handleUserRoleChange(targetUser, role) {
+    try {
+      await apiClient.put(`/users/${targetUser.id}`, {
+        first_name: targetUser.first_name,
+        last_name: targetUser.last_name,
+        role
+      })
+      await loadUsers()
+    } catch (e2) {
+      setError(extractError(e2, 'Не удалось обновить роль пользователя'))
+    }
+  }
+
+  async function handleBlockUser(targetUser) {
+    if (!window.confirm(`Заблокировать пользователя ${targetUser.email}?`)) return
+
+    try {
+      await apiClient.delete(`/users/${targetUser.id}`)
+      await loadUsers()
+    } catch (e2) {
+      setError(extractError(e2, 'Не удалось заблокировать пользователя'))
+    }
+  }
+
+  if (loading) {
+    return <div className="screen-center">Загрузка...</div>
+  }
+
+  if (!user) {
+    return (
+      <div className="screen-center">
+        <div className="auth-card">
+          <h1>Shop Auth</h1>
+
+          <div className="tabs">
+            <button className={`btn ${authMode === 'login' ? 'btn-primary' : ''}`} onClick={() => setAuthMode('login')}>Вход</button>
+            <button className={`btn ${authMode === 'register' ? 'btn-primary' : ''}`} onClick={() => setAuthMode('register')}>Регистрация</button>
+          </div>
+
+          {authMode === 'login' ? (
+            <form onSubmit={handleLogin}>
+              <input placeholder="Email" type="email" value={loginForm.email} onChange={(e) => setLoginForm({ ...loginForm, email: e.target.value })} required />
+              <input placeholder="Password" type="password" value={loginForm.password} onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })} required />
+              <button type="submit" className="btn btn-primary">Войти</button>
+            </form>
+          ) : (
+            <form onSubmit={handleRegister}>
+              <input placeholder="Email" type="email" value={registerForm.email} onChange={(e) => setRegisterForm({ ...registerForm, email: e.target.value })} required />
+              <input placeholder="Имя" value={registerForm.first_name} onChange={(e) => setRegisterForm({ ...registerForm, first_name: e.target.value })} required />
+              <input placeholder="Фамилия" value={registerForm.last_name} onChange={(e) => setRegisterForm({ ...registerForm, last_name: e.target.value })} required />
+              <input placeholder="Password" type="password" value={registerForm.password} onChange={(e) => setRegisterForm({ ...registerForm, password: e.target.value })} required />
+              <select value={registerForm.role} onChange={(e) => setRegisterForm({ ...registerForm, role: e.target.value })}>
+                <option value={ROLE.USER}>Пользователь</option>
+                <option value={ROLE.SELLER}>Продавец</option>
+                <option value={ROLE.ADMIN}>Администратор</option>
+              </select>
+              <button type="submit" className="btn btn-primary">Зарегистрироваться</button>
+            </form>
+          )}
+
+          {error && <p className="error-text">{error}</p>}
+          <p className="hint">Демо: admin@example.com / admin123</p>
+          <p className="hint">Демо: seller@example.com / seller123</p>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="app">
       <header className="app-header">
         <div className="header-inner">
-          <h1>DNS Shop</h1>
-          <div className="header-actions">
-            <button className="btn btn-primary" onClick={() => setAddModal(true)}>Добавить товар</button>
+          <div>
+            <h1>Shop Dashboard</h1>
+            <p>{user.email} | role: {user.role}</p>
           </div>
+          <button className="btn" onClick={handleLogout}>Выйти</button>
         </div>
       </header>
+
       <main>
-        <div className="grid">
-          {products.map(p => (
-            <ProductCard key={p.id} product={p} onClick={() => setSelected(p)} onEdit={(prod) => setEditProduct({...prod})} onDelete={handleDelete} />
-          ))}
-        </div>
+        {error && <p className="error-text global-error">{error}</p>}
+
+        {isSeller && (
+          <section className="panel">
+            <h2>Создание товара</h2>
+            <form onSubmit={handleCreateProduct}>
+              <input placeholder="Название" value={newProduct.title} onChange={(e) => setNewProduct({ ...newProduct, title: e.target.value })} required />
+              <input placeholder="Категория" list="categories" value={newProduct.category} onChange={(e) => setNewProduct({ ...newProduct, category: e.target.value })} required />
+              <datalist id="categories">
+                {categories.map((item) => (
+                  <option key={item} value={item} />
+                ))}
+              </datalist>
+              <input placeholder="Описание" value={newProduct.description} onChange={(e) => setNewProduct({ ...newProduct, description: e.target.value })} required />
+              <input type="number" placeholder="Цена" value={newProduct.price} onChange={(e) => setNewProduct({ ...newProduct, price: e.target.value })} required />
+              <input type="number" placeholder="Остаток" value={newProduct.stock} onChange={(e) => setNewProduct({ ...newProduct, stock: e.target.value })} />
+              <input type="number" step="0.1" placeholder="Рейтинг 0..5" value={newProduct.rating} onChange={(e) => setNewProduct({ ...newProduct, rating: e.target.value })} />
+              <input placeholder="URL изображения" value={newProduct.image} onChange={(e) => setNewProduct({ ...newProduct, image: e.target.value })} />
+              <button type="submit" className="btn btn-primary">Создать товар</button>
+            </form>
+          </section>
+        )}
+
+        <section className="panel">
+          <h2>Товары</h2>
+          <div className="grid">
+            {products.map((product) => (
+              <ProductCard
+                key={product.id}
+                product={product}
+                canEdit={isSeller}
+                canDelete={isAdmin}
+                onClick={() => handleLoadProductById(product.id)}
+                onEdit={(p) => setEditProduct({ ...p, title: p.title || p.name })}
+                onDelete={handleDeleteProduct}
+              />
+            ))}
+          </div>
+        </section>
+
+        {isAdmin && (
+          <section className="panel">
+            <h2>Пользователи</h2>
+            <div className="users-list">
+              {users.map((item) => (
+                <div className="user-row" key={item.id}>
+                  <div>
+                    <strong>{item.email}</strong>
+                    <div>{item.first_name} {item.last_name}</div>
+                    <div>Статус: {item.is_blocked ? 'blocked' : 'active'}</div>
+                  </div>
+                  <div className="user-actions">
+                    <select value={item.role} onChange={(e) => handleUserRoleChange(item, e.target.value)}>
+                      <option value={ROLE.USER}>user</option>
+                      <option value={ROLE.SELLER}>seller</option>
+                      <option value={ROLE.ADMIN}>admin</option>
+                    </select>
+                    <button className="btn btn-danger" disabled={item.is_blocked} onClick={() => handleBlockUser(item)}>Блокировать</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
       </main>
 
-      {selected && (
-        <div className="modal" onClick={() => setSelected(null)}>
+      {selectedProduct && (
+        <div className="modal" onClick={() => setSelectedProduct(null)}>
           <div className="modal-content" onClick={(e) => e.stopPropagation()}>
-            <button className="close" onClick={() => setSelected(null)}>×</button>
-            <img src={selected.image} alt={selected.name} loading="lazy" />
-            <h2>{selected.name}</h2>
-            <p className="category">{selected.category}</p>
-            <p className="desc">{selected.description}</p>
-            <p className="price">Цена: {selected.price} руб.</p>
-            <p>На складе: {selected.stock}</p>
-            <p>Рейтинг: {selected.rating}</p>
-            <div className="modal-actions">
-              <button className="btn btn-primary" onClick={() => { setEditProduct(selected); setSelected(null); }}>Edit</button>
-              <button className="btn btn-danger" onClick={() => { handleDelete(selected.id); }}>Delete</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {addModal && (
-        <div className="modal" onClick={() => setAddModal(false)}>
-          <div className="modal-content" onClick={(e) => e.stopPropagation()}>
-            <button className="close" onClick={() => setAddModal(false)}>×</button>
-            <h2>Добавить товар</h2>
-            <form onSubmit={handleAdd}>
-              <input placeholder="Название" value={newProduct.name} onChange={e => setNewProduct({...newProduct, name: e.target.value})} required />
-              <select value={newProduct.category} onChange={e => setNewProduct({...newProduct, category: e.target.value})} required>
-                <option value="">Выберите категорию</option>
-                {categories.map(c => <option key={c} value={c}>{c}</option>)}
-                <option value="__custom">Добавить свою категорию...</option>
-              </select>
-              {newProduct.category === '__custom' && (
-                <input placeholder="Новая категория" value={newCustomCategory} onChange={e => setNewCustomCategory(e.target.value)} required />
-              )}
-              <input placeholder="Цена" type="number" value={newProduct.price} onChange={e => setNewProduct({...newProduct, price: e.target.value})} required />
-              <input placeholder="Остаток" type="number" value={newProduct.stock} onChange={e => setNewProduct({...newProduct, stock: e.target.value})} required />
-              <input placeholder="Рейтинг" type="number" step="0.1" value={newProduct.rating} onChange={e => setNewProduct({...newProduct, rating: e.target.value})} required />
-              <input placeholder="URL изображения" value={newProduct.image} onChange={e => setNewProduct({...newProduct, image: e.target.value})} required />
-              <input placeholder="Краткое описание" value={newProduct.description} onChange={e => setNewProduct({...newProduct, description: e.target.value})} required />
-              <button className="btn btn-primary" type="submit">Добавить</button>
-            </form>
+            <button className="close" onClick={() => setSelectedProduct(null)}>x</button>
+            {selectedProduct.image && <img src={selectedProduct.image} alt={selectedProduct.title || selectedProduct.name} />}
+            <h2>{selectedProduct.title || selectedProduct.name}</h2>
+            <p className="category">{selectedProduct.category}</p>
+            <p>{selectedProduct.description}</p>
+            <p className="price">Цена: {selectedProduct.price} руб.</p>
+            {selectedProduct.stock !== undefined && <p>Остаток: {selectedProduct.stock}</p>}
+            {selectedProduct.rating !== undefined && <p>Рейтинг: {selectedProduct.rating}</p>}
           </div>
         </div>
       )}
@@ -169,23 +391,16 @@ export default function App() {
       {editProduct && (
         <div className="modal" onClick={() => setEditProduct(null)}>
           <div className="modal-content" onClick={(e) => e.stopPropagation()}>
-            <button className="close" onClick={() => setEditProduct(null)}>×</button>
-            <h2>Редактировать товар</h2>
-            <form onSubmit={handleEditSubmit}>
-              <input value={editProduct.name} onChange={e => setEditProduct({...editProduct, name: e.target.value})} required />
-              <select value={editProduct.category} onChange={e => setEditProduct({...editProduct, category: e.target.value})} required>
-                <option value="">Выберите категорию</option>
-                {categories.map(c => <option key={c} value={c}>{c}</option>)}
-                <option value="__custom">Добавить свою категорию...</option>
-              </select>
-              {editProduct.category === '__custom' && (
-                <input placeholder="Новая категория" value={editCustomCategory} onChange={e => setEditCustomCategory(e.target.value)} required />
-              )}
-              <input type="number" value={editProduct.price} onChange={e => setEditProduct({...editProduct, price: e.target.value})} required />
-              <input type="number" value={editProduct.stock} onChange={e => setEditProduct({...editProduct, stock: e.target.value})} required />
-              <input type="number" step="0.1" value={editProduct.rating} onChange={e => setEditProduct({...editProduct, rating: e.target.value})} required />
-              <input value={editProduct.image} onChange={e => setEditProduct({...editProduct, image: e.target.value})} required />
-              <input value={editProduct.description} onChange={e => setEditProduct({...editProduct, description: e.target.value})} required />
+            <button className="close" onClick={() => setEditProduct(null)}>x</button>
+            <h2>Редактирование товара</h2>
+            <form onSubmit={handleUpdateProduct}>
+              <input value={editProduct.title || ''} onChange={(e) => setEditProduct({ ...editProduct, title: e.target.value })} required />
+              <input value={editProduct.category || ''} onChange={(e) => setEditProduct({ ...editProduct, category: e.target.value })} required />
+              <input value={editProduct.description || ''} onChange={(e) => setEditProduct({ ...editProduct, description: e.target.value })} required />
+              <input type="number" value={editProduct.price || ''} onChange={(e) => setEditProduct({ ...editProduct, price: e.target.value })} required />
+              <input type="number" value={editProduct.stock ?? ''} onChange={(e) => setEditProduct({ ...editProduct, stock: e.target.value })} />
+              <input type="number" step="0.1" value={editProduct.rating ?? ''} onChange={(e) => setEditProduct({ ...editProduct, rating: e.target.value })} />
+              <input value={editProduct.image ?? ''} onChange={(e) => setEditProduct({ ...editProduct, image: e.target.value })} />
               <button className="btn btn-primary" type="submit">Сохранить</button>
             </form>
           </div>

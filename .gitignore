@@ -31,3 +31,5 @@ logs/
 tmp/
 temp/
 .parcel-cache/
+
+*.pdf
