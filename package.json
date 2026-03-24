@@ -1,11 +1,26 @@
 {
-  "devDependencies": {
-    "concurrently": "^9.2.1",
-    "sass-embedded": "^1.97.3"
+  "name": "front_4",
+  "version": "1.0.0",
+  "description": "",
+  "homepage": "https://github.com/RovshanRH/front_4#readme",
+  "bugs": {
+    "url": "https://github.com/RovshanRH/front_4/issues"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RovshanRH/front_4.git"
+  },
+  "license": "ISC",
+  "author": "",
+  "type": "commonjs",
+  "main": "index.js",
   "scripts": {
     "server": "npm --prefix server run dev",
     "client": "npm --prefix client run dev",
     "dev": "concurrently \"npm run server\" \"npm run client\""
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "sass-embedded": "^1.97.3"
   }
 }
