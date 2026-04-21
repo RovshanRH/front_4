@@ -4,14 +4,18 @@ const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const swaggerUi = require('swagger-ui-express');
 const products = require('./products');
+const { createClient } = require("redis");
+
 
 const app = express();
-const PORT = process.env.PORT || 4000;
+const PORT = 4001;
 
 const ACCESS_SECRET = process.env.ACCESS_SECRET || 'access_secret';
 const REFRESH_SECRET = process.env.REFRESH_SECRET || 'refresh_secret';
 const ACCESS_EXPIRES_IN = '15m';
 const REFRESH_EXPIRES_IN = '7d';
+const USERS_CACHE_TTL = 60;       // 1 минута
+const PRODUCTS_CACHE_TTL = 600;   // 10 минут
 
 const ROLES = {
   USER: 'user',
@@ -21,7 +25,24 @@ const ROLES = {
 
 let users = [];
 let nextUserId = 1;
+
+// let products = [];
+
+// redis
 const refreshTokens = new Set();
+
+const redisClient = createClient({
+  url: "redis://127.0.0.1:6379"
+});
+
+redisClient.on("error", (err) => {
+  console.error("Redis error:", err);
+});
+
+async function initRedis() {
+  await redisClient.connect();
+  console.log("Redis connected");
+}
 
 app.use(cors());
 app.use(express.json());
@@ -231,6 +252,16 @@ const openApiSpec = {
         responses: {
           200: {
             description: 'Список пользователей',
+            headers: {
+              'X-Cache': {
+                description: 'Источник ответа: HIT (из Redis), MISS (из сервера), BYPASS (ошибка кэша)',
+                schema: {
+                  type: 'string',
+                  enum: ['HIT', 'MISS', 'BYPASS'],
+                  example: 'HIT'
+                }
+              }
+            },
             content: {
               'application/json': {
                 schema: {
@@ -256,6 +287,16 @@ const openApiSpec = {
         responses: {
           200: {
             description: 'Пользователь',
+            headers: {
+              'X-Cache': {
+                description: 'Источник ответа: HIT (из Redis), MISS (из сервера), BYPASS (ошибка кэша)',
+                schema: {
+                  type: 'string',
+                  enum: ['HIT', 'MISS', 'BYPASS'],
+                  example: 'MISS'
+                }
+              }
+            },
             content: {
               'application/json': {
                 schema: { $ref: '#/components/schemas/User' }
@@ -342,6 +383,16 @@ const openApiSpec = {
         responses: {
           200: {
             description: 'Список товаров',
+            headers: {
+              'X-Cache': {
+                description: 'Источник ответа: HIT (из Redis), MISS (из сервера), BYPASS (ошибка кэша)',
+                schema: {
+                  type: 'string',
+                  enum: ['HIT', 'MISS', 'BYPASS'],
+                  example: 'MISS'
+                }
+              }
+            },
             content: {
               'application/json': {
                 schema: {
@@ -365,6 +416,16 @@ const openApiSpec = {
         responses: {
           200: {
             description: 'Товар',
+            headers: {
+              'X-Cache': {
+                description: 'Источник ответа: HIT (из Redis), MISS (из сервера), BYPASS (ошибка кэша)',
+                schema: {
+                  type: 'string',
+                  enum: ['HIT', 'MISS', 'BYPASS'],
+                  example: 'HIT'
+                }
+              }
+            },
             content: {
               'application/json': {
                 schema: { $ref: '#/components/schemas/Product' }
@@ -489,6 +550,65 @@ function roleMiddleware(allowedRoles) {
     }
     next();
   };
+}
+
+// Middleware чтения из кэша
+function cacheMiddleware(keyBuilder, ttl) {
+  return async (req, res, next) => {
+    try {
+      const key = keyBuilder(req);
+      const cachedData = await redisClient.get(key);
+
+      if (cachedData) {
+        res.set('X-Cache', 'HIT');
+        return res.json(JSON.parse(cachedData));
+      }
+
+      req.cacheKey = key;
+      req.cacheTTL = ttl;
+      res.set('X-Cache', 'MISS');
+      next();
+    } catch (err) {
+      console.error("Cache read error:", err);
+      res.set('X-Cache', 'BYPASS');
+      next();
+    }
+  };
+}
+
+// Сохранение ответа в кэш
+async function saveToCache(key, data, ttl) {
+  try {
+    await redisClient.set(key, JSON.stringify(data), {
+      EX: ttl
+    });
+  } catch (err) {
+    console.error("Cache save error:", err);
+  }
+}
+
+// Удаление кэша пользователей
+async function invalidateUsersCache(userId = null) {
+  try {
+    await redisClient.del("users:all");
+    if (userId) {
+      await redisClient.del(`users:${userId}`);
+    }
+  } catch (err) {
+    console.error("Users cache invalidate error:", err);
+  }
+}
+
+// Удаление кэша товаров
+async function invalidateProductsCache(productId = null) {
+  try {
+    const keys = await redisClient.keys('products:*');
+    if (keys.length > 0) {
+      await redisClient.del(keys);
+    }
+  } catch (err) {
+    console.error("Products cache invalidate error:", err);
+  }
 }
 
 function getRefreshTokenFromHeaders(req) {
@@ -693,66 +813,88 @@ app.get('/api/auth/me', authMiddleware, roleMiddleware([ROLES.USER, ROLES.SELLER
   return res.json(toPublicUser(user));
 });
 
-app.get('/api/users', authMiddleware, roleMiddleware([ROLES.ADMIN]), (req, res) => {
-  return res.json(users.map(toPublicUser));
-});
+app.get(
+  "/api/users",
+  authMiddleware,
+  roleMiddleware(["admin"]),
+  cacheMiddleware(() => "users:all", USERS_CACHE_TTL),
+  async (req, res) => {
+    const data = users.map(toPublicUser);
 
-app.get('/api/users/:id', authMiddleware, roleMiddleware([ROLES.ADMIN]), (req, res) => {
-  const id = Number(req.params.id);
-  const user = users.find(u => u.id === id);
+    await saveToCache(req.cacheKey, data, req.cacheTTL);
+
+    res.json(data);
+  }
+);
+
+app.get(
+  "/api/users/:id",
+  authMiddleware,
+  roleMiddleware(["admin"]),
+  cacheMiddleware((req) => `users:${req.params.id}`, USERS_CACHE_TTL),
+  async (req, res) => {
+    const userId = Number(req.params.id);
+    const user = users.find((u) => u.id === userId);
+
+    if (!user) {
+      return res.status(404).json({
+        error: "User not found"
+      });
+    }
+
+    const data = toPublicUser(user);
+
+    await saveToCache(req.cacheKey, data, req.cacheTTL);
+
+    res.json(data);
+  }
+);
+
+// Обновить пользователя
+app.put("/api/users/:id", authMiddleware, roleMiddleware(["admin"]), async (req, res) => {
+  const { first_name, last_name, role, is_blocked } = req.body;
+  const userId = Number(req.params.id);
+  const user = users.find((u) => u.id === userId);
 
   if (!user) {
-    return res.status(404).json({ error: 'User not found' });
+    return res.status(404).json({
+      error: "User not found"
+    });
   }
 
-  return res.json(toPublicUser(user));
-});
-
-app.put('/api/users/:id', authMiddleware, roleMiddleware([ROLES.ADMIN]), (req, res) => {
-  const id = Number(req.params.id);
-  const user = users.find(u => u.id === id);
-
-  if (!user) {
-    return res.status(404).json({ error: 'User not found' });
-  }
-
-  const firstName = req.body.first_name !== undefined ? String(req.body.first_name).trim() : user.first_name;
-  const lastName = req.body.last_name !== undefined ? String(req.body.last_name).trim() : user.last_name;
-  const role = req.body.role !== undefined ? String(req.body.role).trim().toLowerCase() : user.role;
-
-  if (![ROLES.USER, ROLES.SELLER, ROLES.ADMIN].includes(role)) {
+  if (role !== undefined && ![ROLES.USER, ROLES.SELLER, ROLES.ADMIN].includes(role)) {
     return res.status(400).json({ error: 'Invalid role' });
   }
 
-  user.first_name = firstName;
-  user.last_name = lastName;
-  user.role = role;
+  if (first_name !== undefined) user.first_name = String(first_name).trim();
+  if (last_name !== undefined) user.last_name = String(last_name).trim();
+  if (role !== undefined) user.role = role;
+  if (is_blocked !== undefined) user.is_blocked = Boolean(is_blocked);
 
-  return res.json(toPublicUser(user));
+  await invalidateUsersCache(user.id);
+
+  res.json(toPublicUser(user));
 });
 
-app.delete('/api/users/:id', authMiddleware, roleMiddleware([ROLES.ADMIN]), (req, res) => {
-  const id = Number(req.params.id);
-  const user = users.find(u => u.id === id);
+// Заблокировать пользователя
+app.delete("/api/users/:id", authMiddleware, roleMiddleware(["admin"]), async (req, res) => {
+  const userId = Number(req.params.id);
+  const user = users.find((u) => u.id === userId);
 
   if (!user) {
-    return res.status(404).json({ error: 'User not found' });
+    return res.status(404).json({
+      error: "User not found"
+    });
   }
 
   user.is_blocked = true;
 
-  for (const token of refreshTokens) {
-    try {
-      const payload = jwt.verify(token, REFRESH_SECRET);
-      if (Number(payload.sub) === user.id) {
-        refreshTokens.delete(token);
-      }
-    } catch (error) {
-      refreshTokens.delete(token);
-    }
-  }
+  await invalidateUsersCache(user.id);
 
-  return res.status(204).send();
+  res.json({
+    message: "User blocked",
+    id: user.id
+  });
 });
 
 app.post('/api/products', authMiddleware, roleMiddleware([ROLES.SELLER, ROLES.ADMIN]), (req, res) => {
@@ -765,30 +907,55 @@ app.post('/api/products', authMiddleware, roleMiddleware([ROLES.SELLER, ROLES.AD
   const product = { id: newId, ...validation.data };
   products.push(product);
 
+  invalidateProductsCache().catch((err) => {
+    console.error('Products cache invalidate error:', err);
+  });
+
   return res.status(201).json(toPublicProduct(product));
 });
 
-app.get('/api/products', authMiddleware, roleMiddleware([ROLES.USER, ROLES.SELLER, ROLES.ADMIN]), (req, res) => {
+app.get(
+  '/api/products',
+  authMiddleware,
+  roleMiddleware([ROLES.USER, ROLES.SELLER, ROLES.ADMIN]),
+  cacheMiddleware((req) => {
+    const category = String(req.query.category ?? '').trim();
+    return category ? `products:all:category:${category}` : 'products:all';
+  }, PRODUCTS_CACHE_TTL),
+  async (req, res) => {
   const category = String(req.query.category ?? '').trim();
 
   if (!category) {
-    return res.json(products.map(toPublicProduct));
+    const data = products.map(toPublicProduct);
+    await saveToCache(req.cacheKey, data, req.cacheTTL);
+    return res.json(data);
   }
 
   const filtered = products.filter(p => p.category === category);
-  return res.json(filtered.map(toPublicProduct));
+  const data = filtered.map(toPublicProduct);
+  await saveToCache(req.cacheKey, data, req.cacheTTL);
+  return res.json(data);
 });
 
-app.get('/api/products/:id', authMiddleware, roleMiddleware([ROLES.USER, ROLES.SELLER, ROLES.ADMIN]), (req, res) => {
-  const id = Number(req.params.id);
-  const product = products.find(p => p.id === id);
+app.get(
+  '/api/products/:id',
+  authMiddleware,
+  roleMiddleware([ROLES.USER, ROLES.SELLER, ROLES.ADMIN]),
+  cacheMiddleware((req) => `products:${req.params.id}`, PRODUCTS_CACHE_TTL),
+  async (req, res) => {
+    const id = Number(req.params.id);
+    const product = products.find(p => p.id === id);
 
-  if (!product) {
-    return res.status(404).json({ error: 'Product not found' });
+    if (!product) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+
+    const data = toPublicProduct(product);
+    await saveToCache(req.cacheKey, data, req.cacheTTL);
+
+    return res.json(data);
   }
-
-  return res.json(toPublicProduct(product));
-});
+);
 
 app.put('/api/products/:id', authMiddleware, roleMiddleware([ROLES.SELLER, ROLES.ADMIN]), (req, res) => {
   const id = Number(req.params.id);
@@ -806,6 +973,10 @@ app.put('/api/products/:id', authMiddleware, roleMiddleware([ROLES.SELLER, ROLES
   const updated = { id, ...validation.data };
   products[index] = updated;
 
+  invalidateProductsCache(id).catch((err) => {
+    console.error('Products cache invalidate error:', err);
+  });
+
   return res.json(toPublicProduct(updated));
 });
 
@@ -817,10 +988,20 @@ app.delete('/api/products/:id', authMiddleware, roleMiddleware([ROLES.ADMIN]), (
     return res.status(404).json({ error: 'Product not found' });
   }
 
+  invalidateProductsCache(id).catch((err) => {
+    console.error('Products cache invalidate error:', err);
+  });
+
   products.splice(index, 1);
   return res.status(204).send();
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-});
+initRedis()
+  .catch((error) => {
+    console.error('Redis init failed, continuing without cache:', error);
+  })
+  .finally(() => {
+    app.listen(PORT, () => {
+      console.log(`Server running on http://localhost:${PORT}`);
+    });
+  });
