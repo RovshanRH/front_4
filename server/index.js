@@ -4,14 +4,18 @@ const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const swaggerUi = require('swagger-ui-express');
 const products = require('./products');
+const { createClient } = require("redis");
+
 
 const app = express();
-const PORT = process.env.PORT || 4000;
+const PORT = 3000;
 
 const ACCESS_SECRET = process.env.ACCESS_SECRET || 'access_secret';
 const REFRESH_SECRET = process.env.REFRESH_SECRET || 'refresh_secret';
 const ACCESS_EXPIRES_IN = '15m';
 const REFRESH_EXPIRES_IN = '7d';
+const USERS_CACHE_TTL = 60;       // 1 минута
+const PRODUCTS_CACHE_TTL = 600;   // 10 минут
 
 const ROLES = {
   USER: 'user',
@@ -21,7 +25,24 @@ const ROLES = {
 
 let users = [];
 let nextUserId = 1;
+
+let products = [];
+
+// redis
 const refreshTokens = new Set();
+
+const redisClient = createClient({
+  url: "redis://127.0.0.1:6379"
+});
+
+redisClient.on("error", (err) => {
+  console.error("Redis error:", err);
+});
+
+async function initRedis() {
+  await redisClient.connect();
+  console.log("Redis connected");
+}
 
 app.use(cors());
 app.use(express.json());
@@ -491,6 +512,53 @@ function roleMiddleware(allowedRoles) {
   };
 }
 
+// Middleware чтения из кэша
+function cacheMiddleware(keyBuilder, ttl) {
+  return async (req, res, next) => {
+    try {
+      const key = keyBuilder(req);
+      const cachedData = await redisClient.get(key);
+
+      if (cachedData) {
+        return res.json({
+          source: "cache",
+          data: JSON.parse(cachedData)
+        });
+      }
+
+      req.cacheKey = key;
+      req.cacheTTL = ttl;
+      next();
+    } catch (err) {
+      console.error("Cache read error:", err);
+      next();
+    }
+  };
+}
+
+// Сохранение ответа в кэш
+async function saveToCache(key, data, ttl) {
+  try {
+    await redisClient.set(key, JSON.stringify(data), {
+      EX: ttl
+    });
+  } catch (err) {
+    console.error("Cache save error:", err);
+  }
+}
+
+// Удаление кэша пользователей
+async function invalidateUsersCache(userId = null) {
+  try {
+    await redisClient.del("users:all");
+    if (userId) {
+      await redisClient.del(`users:${userId}`);
+    }
+  } catch (err) {
+    console.error("Users cache invalidate error:", err);
+  }
+}
+
 function getRefreshTokenFromHeaders(req) {
   const headerToken = req.headers['x-refresh-token'];
   if (headerToken) {
@@ -693,66 +761,107 @@ app.get('/api/auth/me', authMiddleware, roleMiddleware([ROLES.USER, ROLES.SELLER
   return res.json(toPublicUser(user));
 });
 
-app.get('/api/users', authMiddleware, roleMiddleware([ROLES.ADMIN]), (req, res) => {
-  return res.json(users.map(toPublicUser));
-});
+app.get(
+  "/api/users",
+  authMiddleware,
+  roleMiddleware(["admin"]),
+  cacheMiddleware(() => "users:all", USERS_CACHE_TTL),
+  async (req, res) => {
+    const data = users.map((u) => ({
+      id: u.id,
+      username: u.username,
+      role: u.role,
+      blocked: u.blocked
+    }));
 
-app.get('/api/users/:id', authMiddleware, roleMiddleware([ROLES.ADMIN]), (req, res) => {
-  const id = Number(req.params.id);
-  const user = users.find(u => u.id === id);
+    await saveToCache(req.cacheKey, data, req.cacheTTL);
 
-  if (!user) {
-    return res.status(404).json({ error: 'User not found' });
+    res.json({
+      source: "server",
+      data
+    });
   }
+);
 
-  return res.json(toPublicUser(user));
-});
+app.get(
+  "/api/users/:id",
+  authMiddleware,
+  roleMiddleware(["admin"]),
+  cacheMiddleware((req) => `users:${req.params.id}`, USERS_CACHE_TTL),
+  async (req, res) => {
+    const user = users.find((u) => u.id === req.params.id);
 
-app.put('/api/users/:id', authMiddleware, roleMiddleware([ROLES.ADMIN]), (req, res) => {
-  const id = Number(req.params.id);
-  const user = users.find(u => u.id === id);
-
-  if (!user) {
-    return res.status(404).json({ error: 'User not found' });
-  }
-
-  const firstName = req.body.first_name !== undefined ? String(req.body.first_name).trim() : user.first_name;
-  const lastName = req.body.last_name !== undefined ? String(req.body.last_name).trim() : user.last_name;
-  const role = req.body.role !== undefined ? String(req.body.role).trim().toLowerCase() : user.role;
-
-  if (![ROLES.USER, ROLES.SELLER, ROLES.ADMIN].includes(role)) {
-    return res.status(400).json({ error: 'Invalid role' });
-  }
-
-  user.first_name = firstName;
-  user.last_name = lastName;
-  user.role = role;
-
-  return res.json(toPublicUser(user));
-});
-
-app.delete('/api/users/:id', authMiddleware, roleMiddleware([ROLES.ADMIN]), (req, res) => {
-  const id = Number(req.params.id);
-  const user = users.find(u => u.id === id);
-
-  if (!user) {
-    return res.status(404).json({ error: 'User not found' });
-  }
-
-  user.is_blocked = true;
-
-  for (const token of refreshTokens) {
-    try {
-      const payload = jwt.verify(token, REFRESH_SECRET);
-      if (Number(payload.sub) === user.id) {
-        refreshTokens.delete(token);
-      }
-    } catch (error) {
-      refreshTokens.delete(token);
+    if (!user) {
+      return res.status(404).json({
+        error: "User not found"
+      });
     }
+
+    const data = {
+      id: user.id,
+      username: user.username,
+      role: user.role,
+      blocked: user.blocked
+    };
+
+    await saveToCache(req.cacheKey, data, req.cacheTTL);
+
+    res.json({
+      source: "server",
+      data
+    });
+  }
+);
+
+// Обновить пользователя
+app.put("/api/users/:id", authMiddleware, roleMiddleware(["admin"]), async (req, res) => {
+  const { username, role, blocked } = req.body;
+  const user = users.find((u) => u.id === req.params.id);
+
+  if (!user) {
+    return res.status(404).json({
+      error: "User not found"
+    });
   }
 
-  return res.status(204).send();
+  if (username !== undefined) user.username = username;
+  if (role !== undefined) user.role = role;
+  if (blocked !== undefined) user.blocked = blocked;
+
+  await invalidateUsersCache(user.id);
+
+  res.json({
+    id: user.id,
+    username: user.username,
+    role: user.role,
+    blocked: user.blocked
+  });
+});
+
+// Заблокировать пользователя
+app.delete("/api/users/:id", authMiddleware, roleMiddleware(["admin"]), async (req, res) => {
+  const user = users.find((u) => u.id === req.params.id);
+
+  if (!user) {
+    return res.status(404).json({
+      error: "User not found"
+    });
+  }
+
+  user.blocked = true;
+
+  await invalidateUsersCache(user.id);
+
+  res.json({
+    message: "User blocked",
+    id: user.id
+  });
+});
+
+initRedis().then(() => {
+  app.listen(PORT, () => {
+    console.log(`Сервер запущен на http://localhost:${PORT}`);
+  });
 });
 
 app.post('/api/products', authMiddleware, roleMiddleware([ROLES.SELLER, ROLES.ADMIN]), (req, res) => {
