@@ -8,7 +8,7 @@ const { createClient } = require("redis");
 
 
 const app = express();
-const PORT = 3000;
+const PORT = 4001;
 
 const ACCESS_SECRET = process.env.ACCESS_SECRET || 'access_secret';
 const REFRESH_SECRET = process.env.REFRESH_SECRET || 'refresh_secret';
@@ -26,7 +26,7 @@ const ROLES = {
 let users = [];
 let nextUserId = 1;
 
-let products = [];
+// let products = [];
 
 // redis
 const refreshTokens = new Set();
@@ -252,6 +252,16 @@ const openApiSpec = {
         responses: {
           200: {
             description: 'Список пользователей',
+            headers: {
+              'X-Cache': {
+                description: 'Источник ответа: HIT (из Redis), MISS (из сервера), BYPASS (ошибка кэша)',
+                schema: {
+                  type: 'string',
+                  enum: ['HIT', 'MISS', 'BYPASS'],
+                  example: 'HIT'
+                }
+              }
+            },
             content: {
               'application/json': {
                 schema: {
@@ -277,6 +287,16 @@ const openApiSpec = {
         responses: {
           200: {
             description: 'Пользователь',
+            headers: {
+              'X-Cache': {
+                description: 'Источник ответа: HIT (из Redis), MISS (из сервера), BYPASS (ошибка кэша)',
+                schema: {
+                  type: 'string',
+                  enum: ['HIT', 'MISS', 'BYPASS'],
+                  example: 'MISS'
+                }
+              }
+            },
             content: {
               'application/json': {
                 schema: { $ref: '#/components/schemas/User' }
@@ -363,6 +383,16 @@ const openApiSpec = {
         responses: {
           200: {
             description: 'Список товаров',
+            headers: {
+              'X-Cache': {
+                description: 'Источник ответа: HIT (из Redis), MISS (из сервера), BYPASS (ошибка кэша)',
+                schema: {
+                  type: 'string',
+                  enum: ['HIT', 'MISS', 'BYPASS'],
+                  example: 'MISS'
+                }
+              }
+            },
             content: {
               'application/json': {
                 schema: {
@@ -386,6 +416,16 @@ const openApiSpec = {
         responses: {
           200: {
             description: 'Товар',
+            headers: {
+              'X-Cache': {
+                description: 'Источник ответа: HIT (из Redis), MISS (из сервера), BYPASS (ошибка кэша)',
+                schema: {
+                  type: 'string',
+                  enum: ['HIT', 'MISS', 'BYPASS'],
+                  example: 'HIT'
+                }
+              }
+            },
             content: {
               'application/json': {
                 schema: { $ref: '#/components/schemas/Product' }
@@ -520,17 +560,17 @@ function cacheMiddleware(keyBuilder, ttl) {
       const cachedData = await redisClient.get(key);
 
       if (cachedData) {
-        return res.json({
-          source: "cache",
-          data: JSON.parse(cachedData)
-        });
+        res.set('X-Cache', 'HIT');
+        return res.json(JSON.parse(cachedData));
       }
 
       req.cacheKey = key;
       req.cacheTTL = ttl;
+      res.set('X-Cache', 'MISS');
       next();
     } catch (err) {
       console.error("Cache read error:", err);
+      res.set('X-Cache', 'BYPASS');
       next();
     }
   };
@@ -556,6 +596,18 @@ async function invalidateUsersCache(userId = null) {
     }
   } catch (err) {
     console.error("Users cache invalidate error:", err);
+  }
+}
+
+// Удаление кэша товаров
+async function invalidateProductsCache(productId = null) {
+  try {
+    const keys = await redisClient.keys('products:*');
+    if (keys.length > 0) {
+      await redisClient.del(keys);
+    }
+  } catch (err) {
+    console.error("Products cache invalidate error:", err);
   }
 }
 
@@ -767,19 +819,11 @@ app.get(
   roleMiddleware(["admin"]),
   cacheMiddleware(() => "users:all", USERS_CACHE_TTL),
   async (req, res) => {
-    const data = users.map((u) => ({
-      id: u.id,
-      username: u.username,
-      role: u.role,
-      blocked: u.blocked
-    }));
+    const data = users.map(toPublicUser);
 
     await saveToCache(req.cacheKey, data, req.cacheTTL);
 
-    res.json({
-      source: "server",
-      data
-    });
+    res.json(data);
   }
 );
 
@@ -789,7 +833,8 @@ app.get(
   roleMiddleware(["admin"]),
   cacheMiddleware((req) => `users:${req.params.id}`, USERS_CACHE_TTL),
   async (req, res) => {
-    const user = users.find((u) => u.id === req.params.id);
+    const userId = Number(req.params.id);
+    const user = users.find((u) => u.id === userId);
 
     if (!user) {
       return res.status(404).json({
@@ -797,26 +842,19 @@ app.get(
       });
     }
 
-    const data = {
-      id: user.id,
-      username: user.username,
-      role: user.role,
-      blocked: user.blocked
-    };
+    const data = toPublicUser(user);
 
     await saveToCache(req.cacheKey, data, req.cacheTTL);
 
-    res.json({
-      source: "server",
-      data
-    });
+    res.json(data);
   }
 );
 
 // Обновить пользователя
 app.put("/api/users/:id", authMiddleware, roleMiddleware(["admin"]), async (req, res) => {
-  const { username, role, blocked } = req.body;
-  const user = users.find((u) => u.id === req.params.id);
+  const { first_name, last_name, role, is_blocked } = req.body;
+  const userId = Number(req.params.id);
+  const user = users.find((u) => u.id === userId);
 
   if (!user) {
     return res.status(404).json({
@@ -824,23 +862,24 @@ app.put("/api/users/:id", authMiddleware, roleMiddleware(["admin"]), async (req,
     });
   }
 
-  if (username !== undefined) user.username = username;
+  if (role !== undefined && ![ROLES.USER, ROLES.SELLER, ROLES.ADMIN].includes(role)) {
+    return res.status(400).json({ error: 'Invalid role' });
+  }
+
+  if (first_name !== undefined) user.first_name = String(first_name).trim();
+  if (last_name !== undefined) user.last_name = String(last_name).trim();
   if (role !== undefined) user.role = role;
-  if (blocked !== undefined) user.blocked = blocked;
+  if (is_blocked !== undefined) user.is_blocked = Boolean(is_blocked);
 
   await invalidateUsersCache(user.id);
 
-  res.json({
-    id: user.id,
-    username: user.username,
-    role: user.role,
-    blocked: user.blocked
-  });
+  res.json(toPublicUser(user));
 });
 
 // Заблокировать пользователя
 app.delete("/api/users/:id", authMiddleware, roleMiddleware(["admin"]), async (req, res) => {
-  const user = users.find((u) => u.id === req.params.id);
+  const userId = Number(req.params.id);
+  const user = users.find((u) => u.id === userId);
 
   if (!user) {
     return res.status(404).json({
@@ -848,19 +887,13 @@ app.delete("/api/users/:id", authMiddleware, roleMiddleware(["admin"]), async (r
     });
   }
 
-  user.blocked = true;
+  user.is_blocked = true;
 
   await invalidateUsersCache(user.id);
 
   res.json({
     message: "User blocked",
     id: user.id
-  });
-});
-
-initRedis().then(() => {
-  app.listen(PORT, () => {
-    console.log(`Сервер запущен на http://localhost:${PORT}`);
   });
 });
 
@@ -874,30 +907,55 @@ app.post('/api/products', authMiddleware, roleMiddleware([ROLES.SELLER, ROLES.AD
   const product = { id: newId, ...validation.data };
   products.push(product);
 
+  invalidateProductsCache().catch((err) => {
+    console.error('Products cache invalidate error:', err);
+  });
+
   return res.status(201).json(toPublicProduct(product));
 });
 
-app.get('/api/products', authMiddleware, roleMiddleware([ROLES.USER, ROLES.SELLER, ROLES.ADMIN]), (req, res) => {
+app.get(
+  '/api/products',
+  authMiddleware,
+  roleMiddleware([ROLES.USER, ROLES.SELLER, ROLES.ADMIN]),
+  cacheMiddleware((req) => {
+    const category = String(req.query.category ?? '').trim();
+    return category ? `products:all:category:${category}` : 'products:all';
+  }, PRODUCTS_CACHE_TTL),
+  async (req, res) => {
   const category = String(req.query.category ?? '').trim();
 
   if (!category) {
-    return res.json(products.map(toPublicProduct));
+    const data = products.map(toPublicProduct);
+    await saveToCache(req.cacheKey, data, req.cacheTTL);
+    return res.json(data);
   }
 
   const filtered = products.filter(p => p.category === category);
-  return res.json(filtered.map(toPublicProduct));
+  const data = filtered.map(toPublicProduct);
+  await saveToCache(req.cacheKey, data, req.cacheTTL);
+  return res.json(data);
 });
 
-app.get('/api/products/:id', authMiddleware, roleMiddleware([ROLES.USER, ROLES.SELLER, ROLES.ADMIN]), (req, res) => {
-  const id = Number(req.params.id);
-  const product = products.find(p => p.id === id);
+app.get(
+  '/api/products/:id',
+  authMiddleware,
+  roleMiddleware([ROLES.USER, ROLES.SELLER, ROLES.ADMIN]),
+  cacheMiddleware((req) => `products:${req.params.id}`, PRODUCTS_CACHE_TTL),
+  async (req, res) => {
+    const id = Number(req.params.id);
+    const product = products.find(p => p.id === id);
 
-  if (!product) {
-    return res.status(404).json({ error: 'Product not found' });
+    if (!product) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+
+    const data = toPublicProduct(product);
+    await saveToCache(req.cacheKey, data, req.cacheTTL);
+
+    return res.json(data);
   }
-
-  return res.json(toPublicProduct(product));
-});
+);
 
 app.put('/api/products/:id', authMiddleware, roleMiddleware([ROLES.SELLER, ROLES.ADMIN]), (req, res) => {
   const id = Number(req.params.id);
@@ -915,6 +973,10 @@ app.put('/api/products/:id', authMiddleware, roleMiddleware([ROLES.SELLER, ROLES
   const updated = { id, ...validation.data };
   products[index] = updated;
 
+  invalidateProductsCache(id).catch((err) => {
+    console.error('Products cache invalidate error:', err);
+  });
+
   return res.json(toPublicProduct(updated));
 });
 
@@ -926,10 +988,20 @@ app.delete('/api/products/:id', authMiddleware, roleMiddleware([ROLES.ADMIN]), (
     return res.status(404).json({ error: 'Product not found' });
   }
 
+  invalidateProductsCache(id).catch((err) => {
+    console.error('Products cache invalidate error:', err);
+  });
+
   products.splice(index, 1);
   return res.status(204).send();
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-});
+initRedis()
+  .catch((error) => {
+    console.error('Redis init failed, continuing without cache:', error);
+  })
+  .finally(() => {
+    app.listen(PORT, () => {
+      console.log(`Server running on http://localhost:${PORT}`);
+    });
+  });
